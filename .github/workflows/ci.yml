@@ -1,0 +1,112 @@
+# 测试矩阵：三个操作系统 × 四个 Node 版本。
+#
+# 为什么需要矩阵：netpeek 有大量平台相关的代码路径 —— ARP 表的三种格式、
+# 命令输出编码、网卡枚举顺序 —— 这些在 Windows 上跑绿完全不能说明 Linux 上没问题。
+# 开发过程中 5 个真实 bug 里有 2 个只在特定平台/语言环境下出现。
+#
+# Node 18.17 是 engines 里声明的最低版本，必须真的测；24 是最新，防止新语法
+# 依赖（findLast / Object.groupBy / JSON import）悄悄混进来。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消旧任务，省钱也省时间
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['18.17', '20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Assert zero runtime dependencies
+        shell: bash
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const runtime = Object.keys(pkg.dependencies ?? {});
+            if (runtime.length > 0) {
+              console.error('runtime dependencies found:', runtime.join(', '));
+              process.exit(1);
+            }
+            console.log('zero runtime dependencies: ok');
+          "
+
+      - name: Syntax check
+        run: node --check bin/netpeek.js
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: End-to-end smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          # iface must always work, on every platform, with no network access
+          node bin/netpeek.js iface --json > iface.json
+          node -e "
+            const r = JSON.parse(require('fs').readFileSync('iface.json', 'utf8'));
+            if (!Array.isArray(r.interfaces) || r.interfaces.length === 0) {
+              console.error('iface reported no interfaces');
+              process.exit(1);
+            }
+            console.log('iface reported', r.interfaces.length, 'addresses');
+          "
+          # exit codes are part of the contract
+          node bin/netpeek.js --version
+          node bin/netpeek.js help > /dev/null
+          if node bin/netpeek.js > /dev/null 2>&1; then
+            echo '::error::a bare invocation must exit non-zero'
+            exit 1
+          fi
+          if node bin/netpeek.js scan not-a-cidr > /dev/null 2>&1; then
+            echo '::error::a bad target must exit non-zero'
+            exit 1
+          fi
+          # a scan of loopback completes even with nothing listening
+          node bin/netpeek.js scan 127.0.0.1/32 --ports 9 --timeout 200 --json > loop.json
+          node -e "
+            const r = JSON.parse(require('fs').readFileSync('loop.json', 'utf8'));
+            if (r.ok !== true) { console.error('loopback scan not ok'); process.exit(1); }
+            console.log('loopback scan completed:', r.summary.alive, 'alive');
+          "
+
+      - name: Packed tarball installs and runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          sandbox=$(mktemp -d)
+          npm pack --pack-destination "$sandbox" > /dev/null
+          npm install --global --prefix "$sandbox/prefix" --cache "$sandbox/cache" \
+            --no-audit --no-fund --loglevel error "$sandbox/$name-$version.tgz"
+          # npm puts the command in a different place per platform
+          bin="$sandbox/prefix/bin/$name"
+          [ -x "$bin" ] || bin="$sandbox/prefix/$name.cmd"
+          [ -e "$bin" ] || bin="$sandbox/prefix/$name"
+          echo "installed command: $bin"
+          "$bin" --version
+          "$bin" iface --json > /dev/null
+          echo "packaged install works"
+          rm -rf "$sandbox"

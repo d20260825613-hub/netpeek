@@ -1,0 +1,53 @@
+{
+  "name": "netpeek",
+  "version": "0.1.0",
+  "description": "Zero-dependency CLI that answers what is actually on your LAN: which addresses are alive, which ports are open, and which vendor owns each device.",
+  "keywords": [
+    "lan",
+    "network",
+    "scan",
+    "port",
+    "arp",
+    "discovery",
+    "cli",
+    "sysadmin"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "netpeek": "bin/netpeek.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node bin/netpeek.js",
+    "test": "node scripts/run-tests.js",
+    "check": "node --check bin/netpeek.js && node --check src/cli.js && node scripts/run-tests.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/d20260825613-hub/netpeek.git"
+  },
+  "bugs": {
+    "url": "https://github.com/d20260825613-hub/netpeek/issues"
+  },
+  "homepage": "https://github.com/d20260825613-hub/netpeek#readme",
+  "author": "d20260825613-hub",
+  "os": [
+    "win32",
+    "darwin",
+    "linux"
+  ]
+}
