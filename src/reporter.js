@@ -64,17 +64,36 @@ export function renderScan(report, { color = false } = {}) {
 
   const lines = [];
   const net = report.network;
+  // The denominator is what this run set out to probe: the range, capped by
+  // --limit. The full size of the uncapped range is the truncation note's job;
+  // printing `totalAddresses` here would claim a /16 scan that hit the cap
+  // reached 65534 addresses.
+  const planned = net.plannedAddresses ?? net.totalAddresses;
   lines.push(
     `${paint('netpeek', 'bold', color)} scanned ${paint(net.cidr, 'cyan', color)}` +
       `${net.interface ? ` on ${net.interface}` : ''}` +
-      ` — ${net.probedAddresses}/${net.totalAddresses} addresses, ` +
+      ` — ${net.probedAddresses}/${planned} addresses, ` +
       `${report.options.ports.length} port(s), ${report.durationMs} ms`,
   );
   if (net.truncated) {
+    // The cap is a property of the range, not of the prefix: a *shorter* prefix
+    // is what makes the range bigger, and a longer one can never cover it, so
+    // the only useful advice is a different range or a raised limit.
     lines.push(
       paint(
-        `  note: range capped at ${net.probedAddresses} addresses; use a longer prefix to cover it all`,
+        `  note: the range holds ${net.totalAddresses} addresses, but only the first ${net.limit} would be probed; ` +
+          'scan a narrower range, or raise the cap with --limit',
         'yellow',
+        color,
+      ),
+    );
+  }
+  if (report.aborted) {
+    lines.push(
+      paint(
+        `  note: scan interrupted after ${net.probedAddresses} of ${net.plannedAddresses ?? net.totalAddresses} ` +
+          'addresses — results are incomplete',
+        'red',
         color,
       ),
     );
@@ -82,7 +101,9 @@ export function renderScan(report, { color = false } = {}) {
   lines.push('');
 
   if (report.hosts.length === 0) {
-    lines.push('  no live hosts found on the probed ports');
+    lines.push(
+      report.aborted ? '  no live hosts found in the part that was scanned' : '  no live hosts found on the probed ports',
+    );
     lines.push(
       paint(
         '  note: a device that answers none of these ports (or is asleep) cannot be seen by TCP probing',
@@ -93,9 +114,7 @@ export function renderScan(report, { color = false } = {}) {
   } else {
     lines.push(`  ${paint('ADDRESS'.padEnd(16), 'bold', color)}${paint('OPEN PORTS'.padEnd(30), 'bold', color)}DEVICE`);
     for (const host of report.hosts) {
-      const ports = host.openPorts
-        .map((p) => formatPort(p))
-        .join(report.options.stopAtFirstOpen ? ', ' : ', ');
+      const ports = host.openPorts.map((p) => formatPort(p)).join(', ');
       const suffix = report.options.stopAtFirstOpen && host.openPorts.length === 1 ? ' (first open port)' : '';
       lines.push(`  ${host.address.padEnd(16)}${(ports + suffix).padEnd(30)}${deviceCell(host)}`);
     }
@@ -129,12 +148,20 @@ export function renderCheck(report, { color = false } = {}) {
   lines.push(`  device: ${deviceCell(report)}`);
   if (report.deviceNote) lines.push(paint(`  note: ${report.deviceNote}`, 'dim', color));
   lines.push('');
-  lines.push(`  ${paint('PORT'.padEnd(14), 'bold', color)}${paint('STATE'.padEnd(18), 'bold', color)}LATENCY`);
+  // The port column has to fit the longest label in this report: "65535" is
+  // five characters and "8080/http-alt" is thirteen. A fixed width that the
+  // longest label overflows pushes every following column out of line, which is
+  // exactly what a table is for.
+  const portWidth = Math.max(14, ...report.ports.map((entry) => formatPort(entry).length + 2));
+  const stateWidth = Math.max(18, ...report.ports.map((entry) => describeStatus(entry.status).length + 2));
+  lines.push(
+    `  ${paint('PORT'.padEnd(portWidth), 'bold', color)}${paint('STATE'.padEnd(stateWidth), 'bold', color)}LATENCY`,
+  );
   for (const entry of report.ports) {
     const label = formatPort(entry);
     const colour = entry.status === 'open' ? 'green' : entry.status === 'closed' ? 'dim' : 'yellow';
     lines.push(
-      `  ${label.padEnd(14)}${paint(describeStatus(entry.status).padEnd(18), colour, color)}` +
+      `  ${label.padEnd(portWidth)}${paint(describeStatus(entry.status).padEnd(stateWidth), colour, color)}` +
         `${entry.status === 'timeout' ? '-' : `${entry.ms} ms`}`,
     );
   }

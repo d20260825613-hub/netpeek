@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   COMMON_PORTS,
+  arpTable,
   mapPool,
   normalizeShortMac,
   parseBsdArp,
@@ -136,6 +137,46 @@ test('readArpTable returns an empty map instead of throwing when the source is m
   });
   assert.equal(table.size, 0);
   assert.deepEqual([...readArpTable({ platform: 'sunos' }).entries()], []);
+});
+
+test('arpTable reads /proc/net/arp on Linux without starting a subprocess', async () => {
+  // Regression: the call site passed readFileSync as the `run` option, so
+  // neither guard inside readArpTable matched, the function returned an empty
+  // map, and every Linux scan silently spawned `arp -an` it did not need — the
+  // /proc branch was unreachable dead code.
+  let spawned = 0;
+  const procText = [
+    'IP address       HW type     Flags       HW address            Mask     Device',
+    '192.168.2.1      0x1         0x2         20:79:18:8e:0a:da     *        wlan0',
+    '',
+  ].join('\n');
+
+  const linux = await arpTable({
+    platform: 'linux',
+    readFile: () => procText,
+    run: () => {
+      spawned += 1;
+      return '';
+    },
+  });
+
+  assert.equal(spawned, 0, 'the kernel table was available, so no command should have run');
+  assert.equal(linux.get('192.168.2.1'), '20:79:18:8E:0A:DA');
+});
+
+test('arpTable falls back to the arp command when /proc/net/arp has nothing usable', async () => {
+  const calls = [];
+  const table = await arpTable({
+    platform: 'linux',
+    readFile: () => 'IP address       HW type     Flags       HW address            Mask     Device\n',
+    run: (command, args) => {
+      calls.push([command, args]);
+      return '? (192.168.2.7) at 20:79:18:8e:a:da on wlan0 [ethernet]\n';
+    },
+  });
+
+  assert.deepEqual(calls, [['arp', ['-an']]]);
+  assert.equal(table.get('192.168.2.7'), '20:79:18:8E:0A:DA');
 });
 
 test('normalizeShortMac pads, rejects junk, and handles every separator', () => {

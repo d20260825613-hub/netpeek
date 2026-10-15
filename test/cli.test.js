@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { OPTION_NAMES, USAGE } from '../src/args.js';
@@ -57,6 +58,14 @@ test('--version prints a semver and nothing else on stdout', async () => {
   const { code, stdout } = await runCli(['--version']);
   assert.equal(code, 0);
   assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/);
+});
+
+test('the reported version matches package.json', async () => {
+  // `netpeek --version` and the version inside every report come from this
+  // constant, so it drifting from the manifest is a release bug in itself.
+  const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  const { stdout } = await runCli(['--version']);
+  assert.equal(stdout.trim(), manifest.version);
 });
 
 test('an unknown command is a usage error with the list of real ones', async () => {
@@ -137,15 +146,105 @@ test('--progress writes to stderr, never to stdout, so JSON stays clean', async 
   assert.match(stderr, /probing/);
 });
 
-test('an aborted scan still returns a report instead of throwing', async () => {
+test('an aborted scan reports itself as incomplete and exits non-zero', async () => {
+  // Regression: an interrupted scan exited 0 and printed a report identical to
+  // a finished one, so a script (or a reader) had no way to tell that most of
+  // the range had never been looked at.
   const controller = new AbortController();
   controller.abort();
-  const { code, stdout } = await runCli(['scan', '10.0.0.0/29', '--ports', '9', '--timeout', '120', '--json'], {
+  const { code, stdout, stderr } = await runCli(
+    ['scan', '10.0.0.0/29', '--ports', '9', '--timeout', '120', '--json'],
+    { abortSignal: controller.signal },
+  );
+  assert.equal(code, 130, 'an interrupted scan must not exit 0');
+  const report = JSON.parse(stdout);
+  assert.equal(report.aborted, true);
+  assert.equal(report.summary.alive, 0);
+  assert.equal(report.network.probedAddresses, 0);
+  assert.ok(report.network.probedAddresses < report.network.totalAddresses);
+  assert.match(stderr, /interrupted after 0 of 6 addresses/);
+});
+
+test('an interrupted scan says so in text output too, not just in JSON', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const { code, stdout } = await runCli(['scan', '10.0.0.0/29', '--ports', '9', '--timeout', '120'], {
     abortSignal: controller.signal,
   });
+  assert.equal(code, 130);
+  assert.match(stdout, /0\/6 addresses/);
+  assert.match(stdout, /interrupted/);
+  assert.match(stdout, /incomplete/);
+});
+
+test('an interrupted capped scan counts against the cap, not the whole range', async () => {
+  // `10.0.0.0/16` is 65534 addresses, of which --limit plans at most 4096. An
+  // interrupt before any probe must not be reported as "0 of 65534": that would
+  // describe a scan that was never going to run.
+  const controller = new AbortController();
+  controller.abort();
+  const { code, stderr } = await runCli(
+    ['scan', '10.0.0.0/16', '--ports', '9', '--timeout', '120', '--limit', '4096', '--json'],
+    { abortSignal: controller.signal },
+  );
+  assert.equal(code, 130);
+  assert.match(stderr, /interrupted after 0 of 4096 addresses/);
+  assert.doesNotMatch(stderr, /65534/);
+});
+
+test('--ports= with nothing after it is a usage error, not a silent default scan', async () => {
+  // Regression: the empty string parsed as falsy, so the whole port validation
+  // block was skipped and the scan quietly probed the 11 default ports the user
+  // had just asked not to use.
+  const { code, stdout, stderr } = await runCli(['scan', '127.0.0.1/32', '--ports=', '--timeout', '150', '--json']);
+  assert.equal(code, 2);
+  assert.match(stderr, /empty port list/);
+  assert.equal(stdout, '', 'nothing should be scanned');
+});
+
+test('--ports with only separators is rejected as well', async () => {
+  const { code, stderr } = await runCli(['scan', '127.0.0.1/32', '--ports', ',,,']);
+  assert.equal(code, 2);
+  assert.match(stderr, /no ports given/);
+});
+
+test('--limit halts a range before it plans to probe it all', async () => {
+  const { code, stdout } = await runCli([
+    'scan',
+    '10.0.0.0/24',
+    '--ports',
+    '9',
+    '--timeout',
+    '120',
+    '--limit',
+    '4',
+    '--json',
+  ]);
   assert.equal(code, 0);
   const report = JSON.parse(stdout);
-  assert.equal(report.summary.alive, 0);
+  assert.equal(report.network.probedAddresses, 4);
+  assert.equal(report.network.totalAddresses, 254);
+  assert.equal(report.network.truncated, true);
+});
+
+test('--limit outside the sane range is a usage error', async () => {
+  const tooSmall = await runCli(['scan', '10.0.0.0/24', '--limit', '0']);
+  assert.equal(tooSmall.code, 2);
+  assert.match(tooSmall.stderr, /--limit must be >= 1/);
+
+  const tooBig = await runCli(['scan', '10.0.0.0/24', '--limit', '1000001']);
+  assert.equal(tooBig.code, 2);
+  assert.match(tooBig.stderr, /--limit must be <= 1000000/);
+
+  const notNumber = await runCli(['scan', '10.0.0.0/24', '--limit', 'lots']);
+  assert.equal(notNumber.code, 2);
+  assert.match(notNumber.stderr, /--limit expects a number/);
+});
+
+test('the --limit help text says what the cap does', async () => {
+  const { stdout } = await runCli(['help']);
+  assert.match(stdout, /--limit <n>/);
+  assert.match(stdout, /default: 4096/);
 });
 
 test('text output never contains ANSI escapes when colour is off', async () => {

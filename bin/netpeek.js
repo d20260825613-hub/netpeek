@@ -21,17 +21,20 @@ function installHandlers() {
   });
 
   let interrupts = 0;
-  const onSignal = (signal) => {
+  const onSignal = () => {
     interrupts += 1;
     if (interrupts === 1) {
       controller.abort();
+      // The report and the exit code carry the real "this scan is incomplete"
+      // answer (130, plus an explicit interrupted note); this line only tells
+      // the user why the terminal went quiet for a moment.
       process.stderr.write('\nnetpeek: stopping the scan; press Ctrl-C again to exit now\n');
       return;
     }
     process.exit(130);
   };
-  process.on('SIGINT', () => onSignal('SIGINT'));
-  process.on('SIGTERM', () => onSignal('SIGTERM'));
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 
   const debug = process.argv.includes('--debug') || process.env.NETPEEK_DEBUG === '1';
   process.on('uncaughtException', (error) => {

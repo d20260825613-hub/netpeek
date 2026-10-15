@@ -29,6 +29,9 @@ Options
                           curated set of 11 ports that home devices answer on)
   -c, --concurrency <n>   probes in flight (default: 128)
   -t, --timeout <ms>      per-port connect timeout (default: 400)
+      --limit <n>         most addresses to probe in one run (default: 4096,
+                          max: 1000000); a range larger than this is cut off
+                          and the report says so
       --all-ports         keep probing after the first open port, so each
                           host reports every open port instead of the first
       --json              JSON output
@@ -42,20 +45,24 @@ Examples
   netpeek scan                          scan your own subnet
   netpeek scan 192.168.1.0/24           scan an explicit range
   netpeek scan 10.0.0.0/24 --ports 1-1024 --concurrency 256
+  netpeek scan 10.0.0.0/16 --limit 20000  raise the cap for a big range
   netpeek check 192.168.1.1 --ports 22,80,443
   netpeek iface --json
   netpeek scan --json > lan.json
 
 Exit codes
-  0  the scan completed
-  1  the scan started and then failed
-  2  the arguments were wrong, or the target cannot be scanned
+  0    the scan completed
+  1    the scan started and then failed
+  2    the arguments were wrong, or the target cannot be scanned
+  130  the scan was interrupted (Ctrl-C) before it finished
 
 Notes
   * Hosts are found with TCP connects, not ICMP: no administrator rights
     needed, and it still works where ping is filtered.
   * MAC addresses and vendors come from the OS ARP table, so they only
     appear for devices this machine has already talked to.
+  * A range larger than --limit is cut off at that many addresses; the report
+    prints "truncated": true and says how many addresses were actually probed.
 `;
 
 /** Option definitions. `default` feeds the value when the flag is absent. */
@@ -63,6 +70,7 @@ const SPEC = {
   ports: { type: 'string' },
   concurrency: { type: 'number', short: 'c', default: 128, min: 1, max: 4096 },
   timeout: { type: 'number', short: 't', default: 400, min: 10, max: 60000 },
+  limit: { type: 'number', default: 4096, min: 1, max: 1000000 },
   'all-ports': { type: 'boolean', default: false },
   json: { type: 'boolean', default: false },
   pretty: { type: 'boolean', default: false },

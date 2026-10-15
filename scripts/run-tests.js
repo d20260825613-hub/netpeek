@@ -16,7 +16,14 @@ import { fileURLToPath } from 'node:url';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-const TEST_FILES = ['test/net.test.js', 'test/args.test.js', 'test/scan.test.js', 'test/discover.test.js', 'test/cli.test.js'];
+const TEST_FILES = [
+  'test/net.test.js',
+  'test/args.test.js',
+  'test/scan.test.js',
+  'test/discover.test.js',
+  'test/render.test.js',
+  'test/cli.test.js',
+];
 
 const args = ['--test', ...TEST_FILES];
 const result = spawnSync(process.execPath, args, {

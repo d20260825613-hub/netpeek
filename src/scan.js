@@ -242,15 +242,33 @@ export function defaultRunner(command, args) {
   });
 }
 
-/** Async wrapper around readArpTable that runs the platform command for real. */
-export async function arpTable({ platform = process.platform } = {}) {
-  const fs = await import('node:fs');
-  if (platform === 'linux') {
-    const direct = readArpTable({ platform, readFile: fs.readFileSync });
+/**
+ * Async wrapper around readArpTable that runs the platform command for real.
+ *
+ * On Linux the kernel's own table is read first and no subprocess is started at
+ * all; `arp` is only spawned when that read fails or yields nothing, or on a
+ * platform with no /proc.
+ *
+ * `readFile` and `run` are injectable only so the "no subprocess on Linux" path
+ * can be proven in a test — the defaults are what the CLI uses.
+ */
+export async function arpTable({
+  platform = process.platform,
+  readFile = null,
+  run = null,
+  directRead = true,
+} = {}) {
+  if (directRead && platform === 'linux') {
+    const fs = await import('node:fs');
+    // The reader goes in as `readFile`: the guard in readArpTable requires both
+    // platform === 'linux' and readFile, and passing it as `run` instead (which
+    // is what this call used to do) made the /proc branch unreachable, so every
+    // Linux scan silently spawned an `arp -an` it did not need.
+    const direct = readArpTable({ platform, readFile: readFile ?? fs.readFileSync, run: null });
     if (direct.size > 0) return direct;
   }
   const command = platform === 'win32' ? '-a' : '-an';
-  const output = await defaultRunner(platform === 'win32' ? 'arp' : 'arp', [command]);
+  const output = await (run ?? defaultRunner)('arp', [command]);
   if (platform === 'win32') return parseWindowsArp(output);
   return parseBsdArp(output);
 }

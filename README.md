@@ -69,6 +69,7 @@ netpeek scan --json --pretty          # 给程序消费
 | `--ports <list>` | 11 个常见端口 | `22,80,443` 或 `1-1024` |
 | `-c, --concurrency <n>` | 128 | 并发探测数 |
 | `-t, --timeout <ms>` | 400 | 单端口连接超时 |
+| `--limit <n>` | 4096 | 一次最多探测多少个地址（上限 1000000）。网段比它大时只扫前 n 个，报告里 `truncated` 为 true |
 | `--all-ports` | 关 | 命中第一个开放端口后继续探测，列出全部 |
 | `--json` / `--pretty` | 关 | JSON 输出 / 缩进 |
 | `--progress` | 关 | 进度写 stderr（不污染 stdout） |
@@ -81,6 +82,21 @@ netpeek scan --json --pretty          # 给程序消费
 | 0 | 扫描完成（即使一台主机都没发现） |
 | 1 | 扫描开始后失败 |
 | 2 | 参数非法，或给的网段不可扫描 |
+| 130 | 扫描被 Ctrl-C 中断，报告只是已扫过的那部分 |
+
+### 被中断的扫描不会被当成完整的扫描
+
+Ctrl-C 之后 netpeek 会把已经扫到的东西打印出来（部分结果也比没有强），但**不会假装它扫完了**：
+
+```
+netpeek scanned 10.0.0.0/21 on WLAN — 887/2046 addresses, 1 port(s), 2518 ms
+  note: scan interrupted after 887 of 2046 addresses — results are incomplete
+
+  no live hosts found in the part that was scanned
+  ...
+```
+
+`--json` 下同样会写明：`"aborted": true`、`"probedAddresses"` 是**真正扫过的地址数**（不是网段大小）、`network.plannedAddresses` 是这次本来打算扫的数量、`errors` 里有一条 `scan interrupted after N of M addresses`。退出码是 130，所以脚本不会把半份结果当成一份完整结果。
 
 ## 它怎么判断"活着"
 
@@ -119,21 +135,42 @@ netpeek scan --json --pretty          # 给程序消费
 netpeek scan --json --pretty > lan.json
 ```
 
+下面是一份真实扫描输出的字段结构（`hosts` 用一台假想主机的数据举例，其余字段与实际输出逐字一致；每次都会变的时间戳也已换成固定值）：
+
 ```jsonc
 {
   "ok": true,
-  "tool": { "name": "netpeek", "version": "0.1.0" },
-  "network": { "cidr": "192.168.2.108/24", "interface": "WLAN", "probedAddresses": 254 },
-  "options": { "ports": [22, 23, 53], "concurrency": 128, "stopAtFirstOpen": true },
-  "summary": { "alive": 2, "arpOnly": 6, "openPortTotal": 2 },
+  "aborted": false,                     // 被 Ctrl-C 打断时会变成 true
+  "tool": { "name": "netpeek", "version": "0.2.0" },
+  "scannedAt": "2026-09-27T10:11:12.131Z",
+  "durationMs": 863,
+  "network": {
+    "cidr": "10.0.0.0/29",
+    "interface": "WLAN",
+    "address": "10.0.0.0",              // 网段的基准地址
+    "prefix": 29,
+    "totalAddresses": 6,                // 这个网段里可用的地址总数
+    "plannedAddresses": 6,              // 本次打算扫多少个（受 --limit 限制）
+    "probedAddresses": 6,               // 真正扫完多少个；被中断时会小于上面那个数
+    "truncated": false,                 // 网段大于 --limit 时为 true
+    "limit": 4096
+  },
+  "options": { "ports": [9, 22, 80], "concurrency": 128, "timeout": 120, "stopAtFirstOpen": true },
+  "summary": { "alive": 1, "withOpenPorts": 1, "arpOnly": 2, "openPortTotal": 1 },
   "hosts": [
-    { "address": "192.168.2.1", "openPorts": [{ "port": 80, "service": "http", "ms": 29.1 }],
-      "mac": "80:AE:54:8B:6A:57", "vendor": "TP-LINK TECHNOLOGIES", "deviceKind": "device" }
+    { "address": "10.0.0.1", "openPorts": [{ "port": 80, "service": "http", "ms": 29.1 }],
+      "mac": "80:AE:54:8B:6A:57", "vendor": "TP-LINK TECHNOLOGIES", "deviceKind": "device",
+      "deviceNote": null }
   ],
   "arpOnly": [
-    { "address": "192.168.2.102", "openPorts": null, "mac": "92:C8:FC:A3:15:AE",
-      "vendor": null, "deviceKind": "randomised", "deviceNote": "locally administered address…" }
-  ]
+    { "address": "192.168.10.1", "openPorts": null, "mac": "08:FF:24:AB:0C:C9",
+      "vendor": null, "deviceKind": "unknown-vendor",
+      "deviceNote": "in the ARP table but no probed port answered" },
+    { "address": "192.168.10.6", "openPorts": null, "mac": "82:1A:BB:BC:59:47",
+      "vendor": null, "deviceKind": "randomised",
+      "deviceNote": "in the ARP table but no probed port answered" }
+  ],
+  "errors": []                          // 被中断时这里是 [ "scan interrupted after N of M addresses..." ]
 }
 ```
 
@@ -147,10 +184,19 @@ import { discover, checkHost, probePort, parseTarget, hostsInRange } from 'netpe
 const report = await discover({ target: '192.168.1.0/24', ports: [{ port: 80 }] });
 for (const host of report.hosts) console.log(host.address, host.vendor);
 
+// 中途放弃：报告照样返回，但会自己说清楚它不完整
+const controller = new AbortController();
+const partial = await discover({ target: '192.168.1.0/24', signal: controller.signal });
+// partial.aborted === true，
+// partial.network.probedAddresses 是真正扫过的地址数，
+// partial.errors[0] === 'scan interrupted after N of M addresses (K not probed); results are incomplete'
+
 // 单端口探测，永不抛异常：refused 是正常答案，不是错误
 const result = await probePort('192.168.1.1', 443, { timeout: 500 });
 // { host, port, status: 'open'|'closed'|'timeout'|'unreachable', ms, error }
 ```
+
+`discover` 的 `limit` 和 `--limit` 是同一个上限（默认 4096）；`arp` 可以注入一张现成的表，这样测试或库调用不会发 UDP 包、也不会起 `arp` 子进程。Linux 上 netpeek 直接读 `/proc/net/arp`，正常情况根本不会启动 `arp`。
 
 网段展开是纯函数，不需要网络，也不受 4096 个地址的默认上限影响：
 
@@ -163,16 +209,17 @@ hostsInRange('10.0.0.0', 8, { limit: 100000 });  // -> 100000 个地址，并标
 - **只支持 IPv4。** IPv6 邻居发现和地址枚举完全是另一套东西，混在一起会让这个工具变得难懂。
 - **不做名称解析。** 不查 DNS、不做 mDNS/NetBIOS 反查。一个会发网络请求的扫描器应该在参数里明确说明这一点，而不是偷偷发。
 - **厂商表是子集。** 约 270 条常见的。查不到就报 unknown，见上。
+- **一次最多扫 4096 个地址**（`--limit` 可调，上限 1000000）。网段比它大时只扫最前面的那些，报告里 `truncated` 为 true 并写明网段实际有多大 —— 不会假装整个 `/16` 都扫过了。
 - **`/24` 扫描约 7 秒**（11 个端口、超时 400ms、并发 128）。要更快就减少端口数或降低超时；`--all-ports` 会明显变慢。
 
 ## 开发
 
 ```bash
-npm test        # 91 个用例，含真实 loopback socket 的端到端探测
+npm test        # 112 个用例，含真实 loopback socket 的端到端探测
 npm run check   # 语法检查 + 测试
 ```
 
-测试分两层：纯函数（网段运算、ARP 解析、OUI 匹配、参数解析）用固定输入断言；探测层**开真实 socket**，因为一个 mock 过的 `connect()` 只能证明 mock 自己是对的。
+测试分两层：纯函数（网段运算、ARP 解析、OUI 匹配、参数解析、表格排版）用固定输入断言；探测层**开真实 socket**，因为一个 mock 过的 `connect()` 只能证明 mock 自己是对的。
 
 ## 许可
 

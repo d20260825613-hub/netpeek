@@ -18,7 +18,7 @@ import {
 import { COMMON_PORTS, arpTable, mapPool, primeArpTable, probePort, serviceName } from './scan.js';
 import { isGroupAddress, isLocallyAdministered, normalizeMac, vendorFor } from './mac.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 /**
  * This machine's own IPv4 addresses, mapped to their interface MAC.
@@ -91,7 +91,7 @@ export function parsePorts(spec) {
  * An explicit address wins; otherwise the interface with a private IPv4 address
  * is used, because that is the LAN the user means when they run this.
  */
-export function resolveTargets({ target = null, interfaces = null } = {}) {
+export function resolveTargets({ target = null, interfaces = null, limit = 4096 } = {}) {
   const table = interfaces ?? os.networkInterfaces();
 
   if (target) {
@@ -103,7 +103,7 @@ export function resolveTargets({ target = null, interfaces = null } = {}) {
       const chosen = pickInterface(table);
       if (!chosen) return { hosts: [], error: 'no external IPv4 interface found' };
       const prefix = parsed.prefix ?? prefixForAddress(chosen) ?? 24;
-      const expanded = hostsInRange(chosen.address, prefix);
+      const expanded = hostsInRange(chosen.address, prefix, { limit });
       return {
         hosts: expanded.hosts,
         interface: chosen.name,
@@ -118,7 +118,7 @@ export function resolveTargets({ target = null, interfaces = null } = {}) {
 
     const chosen = pickInterface(table);
     const prefix = parsed.prefix ?? (chosen ? prefixForAddress(chosen) : null) ?? 32;
-    const expanded = hostsInRange(parsed.address, prefix);
+    const expanded = hostsInRange(parsed.address, prefix, { limit });
     return {
       hosts: expanded.hosts,
       interface: chosen?.name ?? null,
@@ -134,7 +134,7 @@ export function resolveTargets({ target = null, interfaces = null } = {}) {
   const chosen = pickInterface(table);
   if (!chosen) return { hosts: [], error: 'no external IPv4 interface found' };
   const prefix = prefixForAddress(chosen) ?? 24;
-  const expanded = hostsInRange(chosen.address, prefix);
+  const expanded = hostsInRange(chosen.address, prefix, { limit });
   return {
     hosts: expanded.hosts,
     interface: chosen.name,
@@ -182,6 +182,10 @@ export function describeDevice(mac) {
  * `stopAtFirstOpen` trades port detail for speed, which is the right default
  * when the question is "what is on my network" rather than "what is on this
  * particular box".
+ *
+ * An aborted scan (`signal`) returns `aborted: true` and reports how many
+ * addresses were actually probed, so a partial result can never be mistaken for
+ * a complete one.
  */
 export async function discover({
   target = null,
@@ -191,11 +195,13 @@ export async function discover({
   timeout = 400,
   stopAtFirstOpen = true,
   arp = null,
+  run = null,
   onProgress = null,
   signal = null,
+  limit = 4096,
 } = {}) {
   const started = Date.now();
-  const resolved = resolveTargets({ target, interfaces });
+  const resolved = resolveTargets({ target, interfaces, limit });
   if (resolved.error) {
     return { ok: false, error: resolved.error, hosts: [], options: { target, ports: ports.map((p) => p.port) } };
   }
@@ -205,6 +211,10 @@ export async function discover({
     return { ok: false, error: `no probeable addresses in ${resolved.cidr}`, hosts: [], options: {} };
   }
 
+  // `probed` counts the addresses whose probes actually finished. It is the
+  // only honest source for probedAddresses: hostList.length is what the scan
+  // *intended* to cover, and the two differ by exactly the addresses an
+  // interrupt skipped.
   let probed = 0;
   const results = await mapPool(hostList, concurrency, async (host) => {
     if (signal?.aborted) return { host, open: [], alive: false, aborted: true };
@@ -222,15 +232,20 @@ export async function discover({
     return { host, open, alive: open.length > 0 };
   });
 
+  const aborted = Boolean(signal?.aborted);
+  const unprobed = hostList.length - probed;
+
   // Resolve link-layer addresses before reading the table: a host that only
   // answered a TCP connect may have no ARP entry yet, which would report every
   // device as an unknown vendor. Skipped when a caller supplied a table (tests
-  // and API users), because sending packets would be a surprise side effect.
-  if (arp === null) {
+  // and API users), because sending packets would be a surprise side effect —
+  // and skipped after an interrupt, where finishing the scan quickly matters
+  // more than the vendor names of a report that is about to say it is partial.
+  if (arp === null && !aborted) {
     await primeArpTable([...hostList, resolved.address].filter(Boolean));
   }
 
-  const table = arp ?? (await arpTable());
+  const table = arp ?? (await arpTable({ run }));
   const own = ownAddresses({ interfaces });
   const hosts = results
     .filter((entry) => entry && entry.alive)
@@ -265,6 +280,7 @@ export async function discover({
 
   return {
     ok: true,
+    aborted,
     tool: { name: 'netpeek', version: VERSION },
     scannedAt: new Date().toISOString(),
     durationMs: Date.now() - started,
@@ -274,8 +290,12 @@ export async function discover({
       address: resolved.address,
       prefix: resolved.prefix,
       totalAddresses: resolved.total,
-      probedAddresses: hostList.length,
+      // What the scan set out to probe (the range, cut off at `limit`)…
+      plannedAddresses: hostList.length,
+      // …and what it actually finished, which differ after an interrupt
+      probedAddresses: probed,
       truncated: resolved.truncated,
+      limit,
     },
     options: {
       ports: ports.map((p) => p.port),
@@ -291,7 +311,12 @@ export async function discover({
     },
     hosts,
     arpOnly,
-    errors: [],
+    errors: aborted
+      ? [
+          `scan interrupted after ${probed} of ${hostList.length} addresses ` +
+            `(${unprobed} not probed); results are incomplete`,
+        ]
+      : [],
   };
 }
 
@@ -330,6 +355,7 @@ export async function checkHost({
   timeout = 800,
   concurrency = 32,
   arp = null,
+  run = null,
 } = {}) {
   if (!isIPv4(host)) {
     return { ok: false, error: `not an IPv4 address: ${host}` };
@@ -346,7 +372,7 @@ export async function checkHost({
     };
   });
 
-  const table = arp ?? (await arpTable());
+  const table = arp ?? (await arpTable({ run }));
   const device = describeDevice(table.get(host));
 
   return {

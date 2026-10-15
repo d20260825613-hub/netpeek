@@ -216,6 +216,84 @@ test('discover reports progress for every address it probed', async () => {
   assert.equal(seen[seen.length - 1], 6);
 });
 
+test('discover marks an interrupted scan and counts the addresses it really probed', async () => {
+  // Regression: aborting a scan skipped the remaining addresses but the report
+  // still said probedAddresses = the planned range, carried no aborted flag, and
+  // was byte-for-byte a complete report apart from the timing. A user who hit
+  // Ctrl-C was told the whole subnet had been scanned.
+  const controller = new AbortController();
+  const progress = [];
+  const report = await discover({
+    target: '10.88.0.0/24',
+    ports: [{ port: 9 }],
+    concurrency: 8,
+    timeout: 150,
+    arp: new Map(),
+    signal: controller.signal,
+    onProgress: (p) => {
+      progress.push(p.probed);
+      if (p.probed === 8) controller.abort();
+    },
+  });
+
+  const scanned = progress[progress.length - 1];
+  assert.equal(report.ok, true, 'a partial report is still a report');
+  assert.equal(report.aborted, true);
+  assert.equal(report.network.totalAddresses, 254);
+  assert.equal(
+    report.network.probedAddresses,
+    scanned,
+    'probedAddresses must be the number of addresses that were actually probed',
+  );
+  assert.ok(
+    report.network.probedAddresses <= scanned,
+    `probedAddresses ${report.network.probedAddresses} exceeds the ${scanned} addresses that finished`,
+  );
+  assert.notEqual(report.network.probedAddresses, report.network.totalAddresses);
+  assert.ok(report.errors.some((line) => /interrupted/.test(line)), 'the report must say it is incomplete');
+  assert.match(JSON.stringify(report), /interrupted/);
+});
+
+test('discover does not flag a scan that ran to completion', async () => {
+  const report = await discover({ target: '10.0.0.0/29', ports: [{ port: 1 }], timeout: 150, arp: new Map() });
+  assert.equal(report.aborted, false);
+  assert.equal(report.network.probedAddresses, 6);
+  assert.deepEqual(report.errors, []);
+});
+
+test('discover honours the address limit and still reports the whole range', async () => {
+  const report = await discover({
+    target: '10.0.0.0/24',
+    ports: [{ port: 1 }],
+    timeout: 150,
+    arp: new Map(),
+    limit: 4,
+  });
+  assert.equal(report.network.totalAddresses, 254);
+  assert.equal(report.network.probedAddresses, 4);
+  assert.equal(report.network.truncated, true);
+  assert.equal(report.network.limit, 4);
+});
+
+test('discover leaves an injected ARP table alone, without probing the network for it', async () => {
+  // The ARP table is a parameter so a library user (or a test) never triggers
+  // the UDP nudge or an `arp` subprocess as a surprise side effect.
+  let spawned = 0;
+  const report = await discover({
+    target: '10.0.0.0/29',
+    ports: [{ port: 1 }],
+    timeout: 150,
+    arp: new Map([['10.0.0.1', '20:79:18:8E:0A:DA']]),
+    run: () => {
+      spawned += 1;
+      return '';
+    },
+  });
+  assert.equal(report.ok, true);
+  assert.equal(spawned, 0);
+  assert.deepEqual(report.arpOnly.map((h) => h.address), ['10.0.0.1']);
+});
+
 test('checkHost reports every port state, not just the open ones', async () => {
   const server = net.createServer((s) => s.end());
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

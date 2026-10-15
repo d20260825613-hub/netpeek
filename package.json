@@ -1,6 +1,6 @@
 {
   "name": "netpeek",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Zero-dependency CLI that answers what is actually on your LAN: which addresses are alive, which ports are open, and which vendor owns each device.",
   "keywords": [
     "lan",

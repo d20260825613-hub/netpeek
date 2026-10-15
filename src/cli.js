@@ -16,6 +16,7 @@ export const EXIT = {
   OK: 0,
   FAILED: 1,
   USAGE: 2,
+  INTERRUPTED: 130,
 };
 
 /**
@@ -58,7 +59,11 @@ export async function run(argv, io = {}) {
   }
 
   let ports = defaultPorts();
-  if (values.ports) {
+  // Tested against undefined rather than for truthiness: `--ports=` parses to an
+  // empty string, which is falsy, and the old check therefore skipped validation
+  // entirely and silently probed the default port set instead of the (empty)
+  // one the user actually asked for.
+  if (values.ports !== undefined) {
     const parsedPorts = parsePorts(values.ports);
     if (parsedPorts.error) {
       stderr.write(`netpeek: ${parsedPorts.error}\n`);
@@ -92,6 +97,7 @@ export async function run(argv, io = {}) {
       timeout: values.timeout,
       concurrency: values.concurrency,
       arp: io.arp,
+      run: io.run,
     });
     if (!report.ok) {
       stderr.write(`netpeek: ${report.error}\n`);
@@ -109,8 +115,10 @@ export async function run(argv, io = {}) {
     ports,
     concurrency: values.concurrency,
     timeout: values.timeout,
+    limit: values.limit,
     stopAtFirstOpen: !values['all-ports'],
     arp: io.arp,
+    run: io.run,
     onProgress: progress,
     signal: abortSignal,
   });
@@ -120,7 +128,18 @@ export async function run(argv, io = {}) {
     return EXIT.USAGE;
   }
 
+  // An interrupted run is not a failed run, and it is certainly not a completed
+  // one: the report is printed (a partial answer is still worth having) but the
+  // exit code says "not finished" so a script cannot mistake it for a full scan.
+  if (report.aborted) {
+    const planned = report.network.plannedAddresses ?? report.network.totalAddresses;
+    stderr.write(
+      `netpeek: scan interrupted after ${report.network.probedAddresses} of ${planned} ` +
+        'addresses; the report below is incomplete\n',
+    );
+  }
+
   if (values.json) stdout.write(renderJson(report, { pretty: values.pretty }));
   else stdout.write(renderScan(report, { color }));
-  return EXIT.OK;
+  return report.aborted ? EXIT.INTERRUPTED : EXIT.OK;
 }
